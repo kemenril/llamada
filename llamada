@@ -286,8 +286,11 @@ def intToolRun(name: str, args: str, sandbox: str) -> dict:
 def toolRun(name: str, args: str, sandbox: str) -> dict:
     if not name in TOOLS:   #Be absolutely sure we ought to run it.
         return {"error": f"Tool {name} not loaded."}
+    print(f"  \x1b[36m\u23ce\x1b[0m Tool: {name:<18}  ", file=sys.stderr, end="")
     if name in intTOOLS:
+        print("(Internal)",file=sys.stderr,flush=True)
         return intToolRun(name,args,sandbox)
+    print("(WASI)",file=sys.stderr,flush=True)
     return wasmRun(name,args,sandbox)
 
 # Append a row to the session history
@@ -670,7 +673,6 @@ def toolListTools(args,sandbox):
             "name": n,
             "description": s["function"]["description"]
         })
-    print(f"Returning {json.dumps(t)}",file=sys.stderr)
     return json.dumps(t)
 intToolRegister("list_tools",toolListTools,"""
 {
@@ -924,8 +926,13 @@ while True:
                         #We grab it from the last one, here.
                         if chunk.usage:
                             tokenCount += chunk.usage.total_tokens
-                print()
+                #This will mean we've printed something in the stream.
+                if fullContent:
+                    print()
 
+                #We don't print this one, because that has already been done
+                # just above, but we need to assemble it for the tool handler 
+                # below.
                 finalMessage = {
                     "role": "assistant",
                     "content": fullContent or None,

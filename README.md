@@ -65,6 +65,7 @@ There are some command-line options:
         -w, --wrconfig        Write a configuration file matching the given command-
                               line arguments into the session directory.
 
+There is also an online help system which you can access by just typing **help**; the command interpreter will intercept commands defined in the system and will not send them to the remote LLM.  LLMs are smart enough to handle phrasing, so if you want to ask the LLM to do something, but would normally start the sentence with a command-word, just rephrase it.
 
 A simple interactive session might look like this:
 
