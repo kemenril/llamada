@@ -423,7 +423,7 @@ def rmHistory(nRanges=None):
     R = nRanges.split()
     for elem in R:
         if re.search(r"[^\d-]",elem):
-            print(f"Bad number of sequence: {elem}",file=sys.stderr)
+            print(f"Bad number or sequence: {elem}",file=sys.stderr)
             return
         if re.search(r"-",elem):    #Sequence
             seqParams = elem.split("-")
@@ -499,7 +499,7 @@ helpText["unloadtool"] = {
         "syntax": "unloadtool <name>"
 }
 
-#List tools.  This function should eventually list all tools and show whether they are loaded.
+#List all tools and show whether they are loaded.
 def lsTools():
     for iT in intTOOLS:
         loaded = "[ACTIVE]" if iT in TOOLS else ""
@@ -511,8 +511,8 @@ def lsTools():
         #The list comprehension gets us all the schema files, with the extension
         # cut off.
         for eT in [x[:-7] for x in os.listdir(llamada_tool_dir) if x.endswith('.schema')]:
-            #Now we've goe schemas, but we're not absolutel sure it's a tool.
-            # These are wasi:
+            #Now we've goe schemas, but we're not absolutely sure it's a tool.
+            # These are WASI:
             if os.path.exists(os.path.join(llamada_tool_dir,f"{eT}.wasm")):
                 loaded = "[LOADED]" if eT in TOOLS else ""
                 desc = TOOLS[eT]["function"]["description"] if eT in TOOLS else "Description not available until loaded."
