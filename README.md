@@ -10,7 +10,7 @@ Yeah, it talks to your LLM endpoint.  You can run it against something like *Lit
    * *Python* 3 and standard modules
    * The *OpenAI* module for *Python*
    * *wasmedge* for tool calling.  You can probably use the basic functionality without it, or you can modify the code and use another *WASM* runtime.
-   * *llamada_tools*, optionally.  This is a related project which implements a simple set of tools in *Rust*, intended to be built into *WASM* files. and used to exchange data with the LLMs, or perhaps eventually help with other tasks.
+   * [*llamada_tools*](https://github.com/kemenril/llamada_tools), optionally.  This is a related project which implements a simple set of tools in *Rust*, intended to be built into *WASM* files. and used to exchange data with the LLMs, or perhaps eventually help with other tasks.
 
 You also need API access.  If you don't have your own LLM, *Gemini*, *Groq*, and *OpenRouter* all provide decent enough free options which you could use.  You'll need to know the base URL and have an API key handy.  You could have more than one, and set up one or more separate sessions for each.
 
@@ -30,7 +30,7 @@ You'll be able to override everything in it by adding a configuration for each s
 
 There are some other options you can include, for loading tools automatically, for example, but this is a good start.
 
-you may also want to create _~/llamada/tools_, and install some *WASI* binaries there, along with their respective *JSON* schema files.  See the *llamada_tools* project.
+You may also want to create _~/llamada/tools_, and install some *WASI* binaries there, along with their respective *JSON* schema files.  See the [*llamada_tools*](https://github.com/kemenril/llamada_tools) project.
 
 ### Usage
 
