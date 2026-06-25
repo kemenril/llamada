@@ -1,0 +1,8 @@
+[DEFAULT]
+    URL         = https://llmendpoint.local.net/
+    KEY         = sk-ThisIsntARealLLMAccessToken
+    Streaming   = Yes
+    Model       = gpt-4o-mini
+    ValidateSSL = Yes
+    Verbose     = No
+
