@@ -1,0 +1,974 @@
+#!/usr/bin/python3
+
+# Llamada: A simple tool for interacting with LLMs in the terminal.
+# Copyright (c) 2026, Christopher Smith
+
+#For some of the dynamic stuff in the command-line interface
+from inspect import signature
+
+#For some exception handling stuff
+import traceback
+
+#The main point...
+import openai
+
+#We may disable verification, so we need httpx
+import httpx
+
+#For session history
+import sqlite3
+
+#For remote tool calls
+import subprocess
+import json
+
+
+#Might be better than just using the more naive input functions.
+from prompt_toolkit import prompt
+from prompt_toolkit.formatted_text import FormattedText
+from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.key_binding import KeyBindings
+kb = KeyBindings()
+# alt-enter to add new line, enter to submit.
+@kb.add('escape','enter')
+def _(event):
+    event.current_buffer.insert_text("\n")
+@kb.add('enter')
+def _(event):
+    event.current_buffer.validate_and_handle()
+ptHist = InMemoryHistory()
+
+#We'll use this for the default prompt.  This allows functions called to fill
+# in what should appear in the next line.
+ptFill = ""
+
+import sys,os
+import re
+import configparser
+import argparse
+
+import itertools
+
+llamada_state_dir="~/llamada"
+#Python stupidity.  If we don't expandjunk, we don't get the right paths in
+# certain important cases.
+llamada_state_dir=os.path.expandvars(os.path.expanduser(llamada_state_dir))
+llamada_tool_dir=os.path.join(llamada_state_dir,"tools")
+
+#Sessions are in a subdirectory
+llamada_session_base = os.path.join(llamada_state_dir,"sessions")
+
+
+llamada_session="DEFAULT"
+llamada_session_dir=None
+llamada_session_history=None
+llamada_session_sandbox=None
+llamada_histdb_conn=None
+
+#In case we run with no configuration
+#This will almost certainly not work, but it will prevent stack dumps
+fallback_url = 'https://localhost:8080'
+fallback_key = 'Please edit the configuration and add a real API endpoint.'
+fallback_model = "No-model"
+
+#For the help data
+helpText = {}
+helpText[""] = {
+        "shortdesc": "llamada: A simple command-line interface for the OpenAI API.",
+        "desc": "This utility allows you to interact with one or more LLMs through an OpenAI-style API, with a mimimum amount of friction, in the terminal, where you ought to be working."
+}
+
+#Tool registry:
+TOOLS = {}
+
+#This is a separate, permanent table of internal tools in Python functions
+intTOOLS = {}
+
+#Todo:
+#Implement remote tool calls with WASM, WASI
+
+#Try to parse some arguments
+ap = argparse.ArgumentParser(prog="llamada",description="A simple command-line interface for the OpenAI API.")
+ap.add_argument("-P","--progress",action=argparse.BooleanOptionalAction)
+ap.add_argument("-U","--url",help="The BASE API URL.")
+ap.add_argument("-K","--key",help="The API key.")
+ap.add_argument("-M","--model",help="Select the model")
+ap.add_argument("-S","--session",type=str,default=llamada_session,help=f"Use named session, instead of {llamada_session}")
+ap.add_argument("-v","--version",action="version",version="%(prog)s 0.2")
+ap.add_argument("-V","--verbose",action='store_true',help="Print the reasoning ahead of the actual response.")
+ap.add_argument("-i","--interactive",action='store_true',help="Leave the session open and allow interaction.")
+ap.add_argument("--lsmodels",action='store_true',help="List the available models in the remote endpoint and exit.")
+ap.add_argument("--lssessions",action="store_true",help="List the current sessions and exit.")
+ap.add_argument("-w","--wrconfig",action="store_true",help="Write a configuration file matching the given command-line arguments into the session directory.")
+ap.add_argument('question',nargs='*')
+
+args = ap.parse_args()
+
+#The standard Row factory isn't producing output that's close enough to a 
+# real dictionary object to work with the OpenAI API, so a new factory.
+def dbFact_dict(cursor,row):
+    fields = [c[0] for c in cursor.description]
+    return dict(zip(fields,row))
+
+#Write the config back out
+def wrConfig(conf):
+    #Write out a slightly different config
+    #This option is in the config, but we don't treat is as a session variable.  
+    conf.remove_option(llamada_session,"tools")
+    outConf = configparser.ConfigParser()
+    outConf.read_dict(conf)
+    if TOOLS:
+        outConf[llamada_session]["tools"] = json.dumps(list(TOOLS))
+    scFile = os.path.join(llamada_session_dir,"config")
+    with open (scFile,'w') as outFile:
+        print(f"Writing session configuration to {scFile}",file=sys.stderr)
+        outConf.write(outFile)
+helpText["wrconfig"] = {
+    "shortdesc": "Write the session configuration.",
+    "desc": "This writes the current session variables (and incidentally some defaults, which override the global defaults), to the session configuration file in the session directory.  If you have changed some settings, model, endpoint, etc, and want to preserve that change for the next run of this session, do this."
+}
+helpText["writeconfig"] = {"ptr": "wrconfig"}
+helpText["saveconfig"] = {"ptr": "wrconfig"}
+helpText["wrconf"] = {"ptr": "wrconfig"}
+helpText["writeconf"] = {"ptr": "wrconfig"}
+helpText["saveconf"] = {"ptr": "wrconfig"}
+
+#Read and properly handle configuration data
+def getConfig():
+    conf = configparser.ConfigParser()
+    #Assume llamada_state_dir,llamada_session_dir, are already set.
+    conf.read([os.path.join(llamada_state_dir,"config"),os.path.join(llamada_session_dir,"config")])
+
+    #We'll still have no section for our session if no configuration file was
+    # loaded that contains it, so in that case, create an empty one.  Defaults
+    # will be loaded in for most values, but maybe be explicit anyway.
+    if llamada_session != 'DEFAULT' and not conf.has_section(llamada_session):
+        conf.add_section(llamada_session)
+
+    #Merge in the command-line
+    if args.url:
+        conf[llamada_session]["URL"] = str(args.url)
+    if args.key:
+        conf[llamada_session]["Key"] = str(args.key)
+    if args.progress:
+        conf[llamada_session]["Streaming"] = str(args.progress)
+    if args.verbose:
+        conf[llamada_session]["Verbose"] = str(args.verbose)
+
+    #Load all the tools before we might write out the config
+    if conf.has_option(llamada_session,"tools"):
+        for t in json.loads(conf.get(llamada_session,"tools")):
+            loadTool(t)
+        conf.remove_option(llamada_session,"tools")
+        conf.remove_option("DEFAULT","tools")
+
+    if args.wrconfig:
+        wrConfig(conf)
+    return conf
+
+#Probably not ideal, but it will provide *some* information on usage
+tokenCount = 0
+
+#Open a session, initialize some globals.
+def getSession(session):
+    global llamada_session
+    global llamada_session_dir
+    global llamada_session_history
+    global llamada_session_sandbox
+    global llamada_histdb_conn
+
+    #Clear the tool regisry on new session
+    global TOOLS
+    TOOLS= {}
+    
+    llamada_session=session
+    llamada_session_dir=os.path.join(llamada_session_base,session)
+    llamada_session_history=os.path.join(llamada_session_dir,"history.db")
+    llamada_session_sandbox=os.path.join(llamada_session_dir,"files")
+
+    #First, figure out whether we need to create some directories
+    try:
+        if not os.path.exists(llamada_state_dir):
+            print(f"State directory {llamada_state_dir} doesn't exist.  Creating it.",file=sys.stderr)
+            os.mkdir(llamada_state_dir,mode=0o700)
+        if not os.path.exists(llamada_session_base):
+            print(f"Session base directory {llamada_session_base} doesn't exist.  Creating it.",file=sys.stderr)
+            os.mkdir(llamada_session_base,mode=0o700)
+        if not os.path.exists(llamada_session_dir):
+                print(f"Session directory {llamada_session_dir} doesn't exist.  Creating: session",file=sys.stderr,flush=True,end="")
+                os.mkdir(llamada_session_dir,mode=0o700)
+                print(", sandbox",file=sys.stderr,end="",flush=True)
+                os.mkdir(llamada_session_sandbox,mode=0o700)
+                print("",file=sys.stderr)
+    except Exception as e:
+        print(f"\nException creating session directory: {e}",file=sys.stderr)
+        sys.exit(1)
+
+
+    llamada_histdb_conn = sqlite3.connect(llamada_session_history)
+
+    #Allows us to work with "dictionary-like" results, which makes the interface with the OpenAI library a bit easier.
+    llamada_histdb_conn.row_factory = dbFact_dict
+
+
+    try:
+        cursor = llamada_histdb_conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS conversation (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL
+                )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS indRole on conversation (role);")
+        llamada_histdb_conn.commit()
+    except Exception as e:
+        print(f"Exception trying to initialize session history database: {e}", file=sys.stderr)
+        sys.exit(1)
+
+#(Re-)Initialize the connection into the gateway
+def conInit():
+    global tokenCount
+    global c
+    print(f"Connecting to {conf.get(llamada_session,'URL',fallback=fallback_url)}",file=sys.stderr)
+    tokenCount = 0
+    c = openai.OpenAI(api_key=conf.get(llamada_session,'Key',fallback=fallback_key),base_url=conf.get(llamada_session,'URL',fallback=fallback_url),http_client=httpx.Client(verify=conf.getboolean(llamada_session,'ValidateSSL',fallback=False)))
+
+#What happens when we initialize the connection with a new session?
+def sesInit(session = args.session):
+    global conf
+    getSession(session)
+    conf = getConfig()
+    conInit()
+helpText["session"] = {
+        "shortdesc": "Change or reinitialize the session.",
+        "desc": "With no arguments, set the session back to the default specified on the command-line, or DEFAULT.  If run with a session name, Set the session to that name.  Proper reinitialization is done after.",
+        "syntax": "session testsession"
+}
+
+
+#Run a WASI tool
+def wasmRun(tool_name: str, args_json: str, session_dir: str) -> dict:
+    wasm_path = os.path.join(llamada_tool_dir,tool_name +".wasm")
+    if not wasm_path:
+        return {"error": f"Unknown tool: {tool_name}"}
+
+    try:
+        proc = subprocess.run(
+                ["wasmedge", f"--dir=/:{session_dir}", wasm_path],
+            input=args_json,
+            capture_output=True,
+            text=True,
+            timeout=15  # Hard execution budget
+        )
+        if proc.returncode != 0:
+            return {"error": f"Tool failed (rc={proc.returncode}): {proc.stderr.strip()}"}
+        try:
+            return json.loads(proc.stdout)
+        except json.JSONDecodeError as e:
+            return {"error": f"Invalid JSON output from tool: '{proc.stdout.strip()}' (Error: {e})"}
+    except subprocess.TimeoutExpired:
+        return {"error": "Tool execution timed out (15s limit)"}
+    except Exception as e:
+        return {"error": f"Execution error: {str(e)}"}
+
+# Run a built-in tool
+def intToolRun(name: str, args: str, sandbox: str) -> dict:
+    try:
+        return json.loads(intTOOLS[name]["function"](args,sandbox))
+    except json.JSONDecodeError as e:
+        return {"error": f"Invalid JSON output from tool: (Error: {e})"}
+    except Exception as e:
+        return {"error": f"Internal tool error: {str(e)}"}
+    return {"error": f"Internal tool not found: {name}"} 
+
+# Run an internal tool, if available, or a WASI tool
+def toolRun(name: str, args: str, sandbox: str) -> dict:
+    if not name in TOOLS:   #Be absolutely sure we ought to run it.
+        return {"error": f"Tool {name} not loaded."}
+    if name in intTOOLS:
+        return intToolRun(name,args,sandbox)
+    return wasmRun(name,args,sandbox)
+
+# Append a row to the session history
+def addHistory(role,content):
+    c = llamada_histdb_conn.cursor()
+    c.execute("INSERT INTO conversation (role, content) VALUES (:role, :content)",locals())
+    llamada_histdb_conn.commit()
+
+#Get the history
+def getHistory():
+    c = llamada_histdb_conn.cursor()
+    c.execute("select role,content from conversation")
+    return c.fetchall()
+
+def getHistCLI():
+    histCursor = llamada_histdb_conn.cursor()
+    histCursor.execute("select * from conversation")
+    for hItem in histCursor.fetchall():
+        hIText = hItem['content'].strip()
+        hIText = hIText.replace("\n"," ")
+        print(f"{hItem['seq']:>4} | {hItem['role']:<6.6} | {hIText:<58.62}",file=sys.stderr)
+helpText["gethist"] = {
+    "shortdesc": "Show history",
+    "desc": "Prints an entire listing of the history database, complete with metadata, including index numbers, which can be used to redo or remove items from the history.",
+    "also": "redohist, rhmist"
+}
+helpText["gethistory"] = { "ptr" : "gethist" }
+helpText["lshist"] = { "ptr" : "gethist" }
+helpText["lshistory"] = { "ptr" : "gethist" }
+
+
+#Fetch a history entry, fill in the default prompt text with it.
+def redoHistory(seq):
+    global ptFill
+    if not seq.isdecimal():
+        print("Please give a proper history sequence number to redo.",file=sys.stderr)
+        return
+    c = llamada_histdb_conn.cursor()
+    c.execute("select content FROM conversation WHERE seq = ?;",(seq,))
+    r = c.fetchone()
+    if r:
+        ptFill = r['content']
+    else:
+        print(f"Can't find sequence: {seq}",file=sys.stderr)
+helpText['redohistory'] = {
+    'shortdesc': "Copy a history entry into the current prompt.",
+    'desc': "This sets the default text for the next prompt displayed to the contents of the history at the sequence number you provide.  You give the number, from *lshistory*, for example, and then you optionally edit and resubmit the request.",
+    "syntax": "rmhistory <number>",
+    "also": "lshistory, rmhistory"
+
+}
+helpText['redohist'] = {'ptr': 'redohistory' }
+
+#This saves some history data to a file in the sandbox directory.  Maybe later look at getting it to be intelligent about not writing outside of it, but for now, it should be safe because it will always be run by the user.
+def writeHistory(item):
+    if not item:
+        print("You must give a <history sequence number or range>=<filename> argument.",file=sys.stderr)
+        return
+    parts = item.split('=')
+    if not len(parts) > 1:
+        print("You must give a <history sequence number or range>=<filename> argument.",file=sys.stderr)
+        return
+    hseq = parts[0]
+    path = "=".join(parts[1:])
+    try:
+        c = llamada_histdb_conn.cursor()
+        with open(os.path.join(llamada_session_sandbox,path), "w", encoding="utf-8") as f:
+            if hseq.isnumeric():    # One value
+                c.execute("SELECT content FROM conversation WHERE seq = ?",(hseq,))
+            else:
+                hRange=hseq.split("-")
+                if not hRange[0].isnumeric() or not hRange[1].isnumeric() or len(hRange) != 2:
+                        print(f"Got bad history range for write: {hRange}",file=sys.stderr)
+                        return
+                else:   #We have a range of two reasonable numbers here.
+                    c.execute("SELECT content FROM conversation WHERE seq BETWEEN ? AND ?",hRange)
+            print(f"Write {hseq} to {path}", file=sys.stderr)
+            for line in c.fetchall():
+                f.write(line['content'])
+    except Exception as e:
+        print(f"Problem writing to file: {item}, {e}",file=sys.stderr)
+helpText["writehistory"] = {
+    "shortdesc": "Save some history to a file.",
+    "desc": "This command expects an argument in the form of <value (ex: 5) or numeric range (ex: 3-8)>=<file path>  It tries to write the history requested into a file inside of the session sandbox directory.  Note: the function itself is not very well sandboxed, please don't run any kind of automation against it at the moment.",
+    "syntax": "writehistory 12\n\twritehistory 9-13",
+    "also": "lshistory, getfile"
+}
+helpText["writehist"] = { "ptr": "writehistory" }
+helpText["wrhistory"] = { "ptr": "writehistory" }
+helpText["wrhist"] = { "ptr": "writehistory" }
+
+
+#Read a file into the prompt
+def getFile(path=""):
+    global ptFill
+    if not path:
+        print(f"Please provide a path, relative to the session sandbox in {llamada_session_sandbox}",file=sys.stderr)
+        return
+    absPath = os.path.join(llamada_session_sandbox,path)
+    try:
+        print(f"Reading {absPath} into command buffer.", file=sys.stderr)
+        with open(absPath, "r", encoding="utf-8") as f:
+            ptFill = f.read()
+    except Exception as e:
+        print(f"Problem reading {absPath}: {e}",file=sys.stderr)
+
+helpText["getfile"] = {
+    "shortdesc": "Read a file into the command buffer.",
+    "desc": "This command loads a file (by relative path) from the sandbox directory directly into the next command.  You may optionally edit the buffer before sending it.",
+    "syntax": "getfile <file>"
+}
+helpText["readfile"] = { "ptr": "getfile" }
+
+
+
+#Remove elements from history
+def rmHistory(nRanges=None):
+
+    if not nRanges:
+        print("Nothing specified to remove",file=sys.stderr)
+        return
+    c = llamada_histdb_conn.cursor()
+    rows = 0;
+    #We should accept , as a separator, but it should be functionally identical
+    # to space in every case which matters.
+    nRanges = nRanges.replace(',', ' ')
+    #This causes Python automatically clip the extra spaces.
+    nRanges = " ".join(nRanges.split())
+    #Normalize the numeric ranges
+    nRanges = nRanges.replace("\s*-\s*",'-')
+    #Now we have a list of numbers and ranges
+
+    R = nRanges.split()
+    for elem in R:
+        if re.search(r"[^\d-]",elem):
+            print(f"Bad number of sequence: {elem}",file=sys.stderr)
+            return
+        if re.search(r"-",elem):    #Sequence
+            seqParams = elem.split("-")
+            if len(seqParams) != 2:
+                print("Each sequence must contain exactly two numbers.",file=sys.stderr)
+                return
+            if not (seqParams[0].isnumeric() and seqParams[1].isnumeric()):
+                print(f"Bad number in sequence {elem}",file=sys.stderr)
+                return
+            #Ok, this is a valid range
+            c.execute("DELETE FROM conversation WHERE seq BETWEEN ? AND ?",(seqParams[0],seqParams[1]))
+            rows += c.rowcount
+        else:   #Single number
+            if re.search(r"\D",elem):
+                # ... and a bad number
+                print(f"Not a number: {elem}",file=sys.stderr)
+                return
+            c.execute("DELETE FROM conversation WHERE seq = ?",(elem,))
+            rows += c.rowcount
+    llamada_histdb_conn.commit()
+    print(f"{rows} rows deleted.",file=sys.stderr)
+helpText["rmhistory"] = {
+    "shortdesc": "Remove items from the history.",
+    "desc": "This will remove a list of numbers (1 2 3) or range of numbers (4-9), or a list of ranges and numbers (1 3 9-12 34 40-49), from the history.  Sequence numbers can be found in *lshistory*.",
+    "syntax": "rmhistory 1 2 6-8 12-14",
+    "also": "lshistory"
+}
+helpText["rmhist"] = { "ptr": "rmhistory" }
+helpText["delhistory"] = { "ptr": "rmhistory" }
+helpText["delhist"] = { "ptr": "rmhistory" }
+
+#Load/unload tools
+def loadTool(t):
+    #Maybe it's already loaded
+    if t in intTOOLS:   #This is a built-in tool.
+        print(f"Activating internal tool {t}")
+        TOOLS[t] = intTOOLS[t]["schema"]
+        return
+    w = os.path.join(llamada_tool_dir,f"{t}.wasm")
+    s = os.path.join(llamada_tool_dir,f"{t}.schema")
+    if not (os.path.isfile(w) and os.path.isfile(s)):
+        print(f"Tool or schema missing for {t}.",file=sys.stderr)
+        return
+    #In case of a mid-session update, clear old data first.
+    if t in TOOLS:
+        del TOOLS[t]
+    try:
+        with open(s, "r", encoding="utf-8") as sFile:
+            sData = sFile.read()
+            TOOLS[t] =  json.loads(sData)
+            if TOOLS[t]:
+                print(f"Loaded {t}",file=sys.stderr)
+            else:
+                print(f"Failed to load {t}, but no exception thrown.",file=sys.stderr)
+    except Exception as e:
+        print(f"Problem loading {t}: {e}",file=sys.stderr)
+        return
+helpText["loadtool"] = {
+    "shortdesc": "Load/enable a tool.",
+    "desc": "Give the name of a tool. The schema will be loaded from the tools directory, and the tool will become available for calls.",
+    "syntax": "loadtool <name>"
+}
+
+def unloadTool(t):
+    if not t in TOOLS:
+        print(f"{t} is not loaded.",file=sys.stderr)
+        return
+    print(f"Unloading {t}",file=sys.stderr)
+    del TOOLS[t]
+helpText["unloadtool"] = {
+        "shortdesc": "Unload/disable a tool.",
+        "desc": "Give the name of a tool. The schema will be expunged from memory.",
+        "syntax": "unloadtool <name>"
+}
+
+#List tools.  This function should eventually list all tools and show whether they are loaded.
+def lsTools():
+    for iT in intTOOLS:
+        loaded = "[ACTIVE]" if iT in TOOLS else ""
+        desc = intTOOLS[iT]['schema']['function']['description']
+        print(f"{iT:<20}{loaded:>10.10} (Internal)", file=sys.stderr)
+        print(f"   {desc}\n",file=sys.stderr)
+    
+    if os.path.exists(llamada_tool_dir):
+        #The list comprehension gets us all the schema files, with the extension
+        # cut off.
+        for eT in [x[:-7] for x in os.listdir(llamada_tool_dir) if x.endswith('.schema')]:
+            #Now we've goe schemas, but we're not absolutel sure it's a tool.
+            # These are wasi:
+            if os.path.exists(os.path.join(llamada_tool_dir,f"{eT}.wasm")):
+                loaded = "[LOADED]" if eT in TOOLS else ""
+                desc = TOOLS[eT]["function"]["description"] if eT in TOOLS else "Description not available until loaded."
+                print(f"{eT:<24}{loaded:>10.10} (WASI)", file=sys.stderr)
+                print(f"   {desc}\n",file=sys.stderr)
+
+helpText["lstools"] = {
+        "shortdesc": "List tools",
+        "desc": "Show a list of loaded tools,",
+        "also": "loadtool, unloadtool"
+}
+
+
+#Handle changing around and viewing config variables
+def setVar(v=""):
+    if not v:   # In this case, print the whole namespace
+        print(f"Session: {llamada_session}",file=sys.stderr)
+        for k in conf[llamada_session].keys():
+            print(f"{k:>16}: {conf[llamada_session][k]:<32}", file=sys.stderr,end="")
+            if conf.has_option('DEFAULT',k):
+                if conf[llamada_session][k] != conf['DEFAULT'][k]:
+                    print(f"; DEFAULT: {conf['DEFAULT'][k]}",file=sys.stderr,end="")
+            else:
+                #We've set this variable and it doesn't exist in DEFAULT
+                print("; DEFAULT: <UNSET>",file=sys.stderr,end="")
+            print(file=sys.stderr)
+    else:
+        if not re.search(r"=",v):   #Print a single value.
+            print(f"{v}: {conf.get(llamada_session,v,fallback='<Does not exist.>')}",file=sys.stdout)
+            return
+        else:   #Assignment
+            segments = v.split('=')
+            name=segments[0].lower()
+            val="=".join(segments[1:])
+            if not val:
+                conf.remove_option(llamada_session,name)
+                print(f"Remove {name}",file=sys.stderr)
+            else:
+                conf.set(llamada_session,name,val)
+                print(f"Set {name} to {val}",file=sys.stderr)
+            if name in varHooks:
+                #print(f"Hook function found for {name}.  Running it.",file=sys.stderr)
+                varHooks[name]()
+helpText["setenv"] = {
+        "shortdesc": "Modify configuration variables.",
+        "desc": "You can read and set individual variables, or, with no arguments, print the whole list.",
+        "syntax": "setenv <var>=<value> #To set a value\n\tsetenv <var> # To print one value\n\tsetenv # To print a whole list"
+}
+
+#List of available models
+def lsModels(conn):
+    try:
+        r = conn.models.list()
+        for m in r.data:
+            print(f"{m.id} ({m.owned_by})",file=sys.stdout)
+    except Exception as e:
+        print(f"Error getting model list: {e}.  The endpoint may not support this call.",file=sys.stderr)
+
+helpText["lsmodels"] = {
+        "shortdesc": "List available models",
+        "desc": "Prints a list of available models, with a bit of extra information."
+}
+
+#List the current sessions
+def lsSessions():
+    if not os.path.exists(llamada_session_base):
+        print("No state directory exists.  There can be no sessions.",file=sys.stderr)
+        return
+    sesCount = 0;
+    print("Sessions:",file=sys.stderr)
+    for dir in [x for x in os.listdir(llamada_session_base) if os.path.isdir(os.path.join(llamada_session_base,x))]:
+        print(f"\t{dir}",file=sys.stderr)
+        sesCount += 1
+    print(f"\n{sesCount} sessions.", file=sys.stderr)
+
+helpText["lssessions"] = {
+        "shortdesc": "List sessions",
+        "desc": f"Prints a list of sessions on disk.  This is identical to listing out all the top-level subdirectories of the state directory: {llamada_state_dir}"
+}
+helpText["lsses"] = { "ptr": "lssessions" }
+helpText["listsessions"] = { "ptr": "lssessions" }
+helpText["listses"] = { "ptr": "lssessions" }
+helpText["getses"] = { "ptr": "lssessions" }
+helpText["getsessions"] = { "ptr": "lssessions" }
+
+#Handle help
+def help(subject=""):
+    if subject in helpText:
+        #Some commands are aliases to others.
+        # Maybe skip them for brevity.
+        if "ptr" in helpText[subject]:
+            print(f"{subject}  ({helpText[subject]['ptr']})\n",file=sys.stderr)
+            subject = helpText[subject]['ptr']
+        else:
+            print(f"{subject}\n",file=sys.stderr)
+        sHelp = helpText[subject]
+        if 'shortdesc' in sHelp:
+            print(sHelp['shortdesc'] + "\n",file=sys.stderr)
+        if "desc" in sHelp:
+            print(f"\t{sHelp['desc']}\n",file=sys.stderr)
+        if "syntax" in sHelp:
+            print(f"Syntax:\n\t{sHelp['syntax']}\n",file=sys.stderr)
+        if "examples" in sHelp:
+            print(f"Examples:\n{sHelp['examples']}\n",file=sys.stderr)
+        if "also" in sHelp:
+            print(f"See also:\n\t{sHelp['also']}\n",file=sys.stderr)
+
+        #The special case of top-level help
+        if not subject:
+            print("The following commands are available, and will be intercepted and handled by the local software.",file=sys.stderr)
+            for cmd in cmdTable.keys():
+                if cmd in helpText and 'ptr' in helpText[cmd]:
+                    #Maybe just skip the aliases for brevity.
+                    continue
+                desc = helpText[cmd]['shortdesc'] if cmd in helpText and 'shortdesc' in helpText[cmd] else "No description."
+                print(f"{cmd:<16}{desc}",file=sys.stderr)
+            print("You may be able to get documentation for individual commands by writing *help <command>*.",file=sys.stderr)
+
+    else:
+        print(f"No help entry found for {subject}.",file=sys.stderr)
+helpText["help"] = {
+        "shortdesc": "This help.",
+        "desc": f"This command prints the top-level help, or with arguments given, tries to find help about the requested item."
+}
+helpText["?"] = { "ptr": "help" }
+
+
+
+#Clean exit command
+def quit():
+    print("Exiting.",file=sys.stderr)
+    sys.exit(0)
+helpText["quit"] = {
+        "shortdesc": "Exit the program.",
+        "desc": f"Cleans up, such as the cleanup process is, and exits."
+}
+helpText["exit"] = { "ptr": "quit" }
+helpText["bye"] = { "ptr": "quit" }
+
+### Internal tools.  These functions are intended to be called, indirectly, by 
+# the remote LLM.  Each function has an tool name and a schema attached.  
+# Probably be very careful not to handle input from the LLM here, if it can be 
+#avoided.  We pass the session directory as the second parameter just in case 
+# it can't be avoided.
+def intToolRegister(name,func,schema):
+    intTOOLS[name] =  {
+        "function": func,
+        "schema": json.loads(schema)
+    }
+
+def toolListTools(args,sandbox):
+    t = []
+    for n, s in TOOLS.items():
+        t.append({
+            "name": n,
+            "description": s["function"]["description"]
+        })
+    print(f"Returning {json.dumps(t)}",file=sys.stderr)
+    return json.dumps(t)
+intToolRegister("list_tools",toolListTools,"""
+{
+  "type": "function",
+  "function": {
+    "name": "list_tools",
+    "description": "Provides a list, in the loaded_tools property, of tool calls available to you.",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    }
+  }
+}
+""")
+
+
+def toolGetToolSchema(args,sandbox):
+    #Args are in stupid JSON
+    jArgs = json.loads(args)
+    if "tool" in jArgs and jArgs['tool'] in TOOLS:
+        return json.dumps(TOOLS[jArgs['tool']])
+    return '{}'
+intToolRegister("get_tool_schema",toolGetToolSchema,"""
+{
+  "type": "function",
+  "function": {
+    "name": "get_tool_schema",
+    "description": "Get JSON schema of the tool named in the 'tool' property.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "tool": {
+          "type": "string",
+          "description": "The name of a loaded tool (perhaps from a call to list_tools) for which to return the schema."
+        }
+      },
+      "required": ["tool"],
+      "additionalProperties": false
+    }
+  }
+}
+""")
+#####
+
+#For the command-line
+cmdTable = {
+    "reconnect":    conInit,
+
+    "lsmodels":     lambda: lsModels(c),
+    "setenv":       setVar,
+    "getfile":      getFile,
+    "readfile":     getFile,
+
+    #Session
+    "session":      sesInit,
+    "lssessions":   lsSessions,
+    "lsses":        lsSessions,
+    "listsessions": lsSessions,
+    "listses":      lsSessions,
+    "getsessions":  lsSessions,
+    "getses":       lsSessions,
+
+    #History
+    "lshistory":    getHistCLI,
+    "lshist":       getHistCLI,
+    "gethistory":   getHistCLI,
+    "gethist":      getHistCLI,
+    "writehist":    writeHistory,
+    "writehistory": writeHistory,
+    "wrhist":       writeHistory,
+    "wrhistory":    writeHistory,
+
+    "redohist":     redoHistory,
+    "redohistory":  redoHistory,
+
+    "rmhist":       rmHistory,
+    "delhist":      rmHistory,
+    "rmhistory":    rmHistory,
+    "delhistory":   rmHistory,
+    
+    #Tools
+    "loadtool":     loadTool,
+    "unloadtool":   unloadTool,
+    "lstools":       lsTools,
+    #Config management
+    "wrconfig":     lambda: wrConfig(conf),
+    "writeconfig":  lambda: wrConfig(conf),
+    "saveconfig":   lambda: wrConfig(conf),
+    "wrconf":       lambda: wrConfig(conf),
+    "writeconf":    lambda: wrConfig(conf),
+    "saveconf":     lambda: wrConfig(conf),
+
+    #Help
+    "help":         help,
+    "?":            help,
+
+    "exit":         quit,
+    "bye":          quit,
+    "quit":         quit,
+
+}
+
+#Functions executed after variables are changed
+varHooks = {
+    "url":          conInit,
+    "key":          conInit,
+    "validatessl":  conInit,
+    "session":      lambda: sesInit(conf.get(llamada_session,'session')),
+}
+
+#Init.
+
+#We put this before session init, instead of down there, because it saves us
+# from actually coming up and building the default (or whatever) session, when
+# the work we're doing is entirely outside of a session.
+
+if args.lssessions:
+    lsSessions()
+    sys.exit(0)
+
+#Now init, before doing anything that needs it.
+sesInit()
+
+#Maybe we're doing something other than interacting with a model
+if args.lsmodels:
+    lsModels(c)
+    sys.exit(0)
+
+
+#Check that we're asking it to do something
+if not args.question:
+    print("No question given, forcing interactive mode.",file=sys.stderr)
+    args.interactive = True
+
+
+Q="".join(args.question)
+
+# Main execution loop
+while True:
+    if not Q and args.interactive:
+        try:
+            promptString = [('bold underline',conf.get(llamada_session,'Model',fallback=fallback_model))]
+            if tokenCount:
+                promptString.append(('fg:ansicyan',f" ({tokenCount})"))
+            promptString.append(('bold',"> "))
+            Q = prompt(FormattedText(promptString),
+                       key_bindings=kb, multiline=True, history=ptHist, 
+                       prompt_continuation="", default=ptFill)
+            ptFill = "" 
+        except EOFError:
+            print("Got EOF. Exiting.")
+            sys.exit(0)
+        except KeyboardInterrupt:
+            print("Interrupt.", file=sys.stderr)
+            Q = ""
+            continue
+
+    # Local Commands
+    if Q:
+        components = Q.split()
+        if components and components[0].lower().strip() in cmdTable:
+            nCmd = components[0].lower().strip()
+            nPars = " ".join(components[1:])
+            
+            callForm = len(signature(cmdTable[nCmd]).parameters)
+            if callForm == 0:
+                cmdTable[nCmd]()
+            elif callForm == 1:
+                cmdTable[nCmd](nPars)
+            else:
+                print(f"Not plumbed for commands requiring {callForm} parameters.", file=sys.stderr)
+            
+            Q = ""
+            continue # Skip LLM logic entirely
+
+    # LLM
+    if Q:
+        messages = getHistory()
+        addHistory("user", Q)
+        messages.append({"role": "user", "content": Q})
+        
+        useStreaming = conf.getboolean(llamada_session, 'Streaming', fallback=False)
+
+        #Print an indication that we are sending a query
+        print("\u2199", flush=True)
+        while True:  # Tool/Response internal loop
+            try:
+                response = c.chat.completions.create(
+                    model=conf.get(llamada_session, 'Model', fallback=fallback_model),
+                    messages=messages,
+                    tools=[ t for t in TOOLS.values()] if TOOLS.values() else None,
+                    stream=useStreaming,
+                    stream_options={"include_usage": True} if useStreaming else None
+                )
+            except Exception as e:
+                print(f"\n\x1b[31m⚠ LLM API Error:\x1b[0m {str(e)}", file=sys.stderr)
+                break
+
+            finalMessage = None
+            finishReason = None
+
+            if useStreaming:
+                fullContent = ""
+                fullReasoning = ""
+                fullToolCalls = {} 
+                
+                for chunk in response:
+                    #Apparently sometimes there are empty chunks which function
+                    # as a heartbeat signal, but also we tack usage onto the
+                    # end in a separate chunk.  This may screw up tool calls if
+                    # it's not handled in such a way that we forget about it 
+                    # before handling them below.
+                    if not chunk.choices:
+                        if chunk.usage:
+                            tokenCount += chunk.usage.total_tokens
+                        continue
+
+                    choice = chunk.choices[0]
+                    delta = choice.delta
+                    #print(repr(chunk), file=sys.stderr)
+
+                    if delta.content:
+                        print(delta.content, end="", flush=True)
+                        fullContent += delta.content
+
+                    if hasattr(delta,"reasoning_content") and delta.reasoning_content:
+                        fullReasoning += delta.reasoning_content
+
+                    if delta.tool_calls:
+                        for tc in delta.tool_calls:
+                            idx = tc.index
+                            if idx not in fullToolCalls:
+                                #fullToolCalls[idx] = tc
+                                fullToolCalls[idx] = {
+                                        "id": tc.id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": tc.function.name, 
+                                            "arguments": tc.function.arguments or "", 
+                                        },
+                                        "extra_content": tc.extra_content if hasattr(tc,"extra_content") else None 
+                                        }
+                            else:
+                                fullToolCalls[idx]["function"]["arguments"] += tc.function.arguments or ""
+                    if choice.finish_reason:                    
+                        finishReason = choice.finish_reason
+                        #Gemini, at least adds the (total, per call) usage on 
+                        # all the chunks instead of submitting it separately.  
+                        #We grab it from the last one, here.
+                        if chunk.usage:
+                            tokenCount += chunk.usage.total_tokens
+                print()
+
+                finalMessage = {
+                    "role": "assistant",
+                    "content": fullContent or None,
+                    "tool_calls": list(fullToolCalls.values()) if fullToolCalls else None,
+                    "reasoning_content": fullReasoning or None
+                }
+
+            else: #Streaming is off
+                # Because streaming is a mess, we move this data around too.
+                tokenCount += response.usage.total_tokens
+                finalMessage = response.choices[0].message.model_dump()
+                finishReason = response.choices[0].finish_reason
+                if finalMessage["content"]:
+                    print(finalMessage["content"])
+
+            # Actual tool execution
+            #if finishReason == "tool_calls" and finalMessage.tool_calls:
+            #Gemini is weird about the finish reason in this vicinity.
+            # Maybe we just check for any tool calls and execute them where we
+            # find them.
+            if finalMessage["tool_calls"]:
+                print(f"\x1b[36m\u23ce\x1b[0m Executing {len(finalMessage['tool_calls'])} tool(s)...", file=sys.stderr, flush=True)
+                messages.append(finalMessage)
+
+                for tc in finalMessage["tool_calls"]:
+                    result = toolRun(tc["function"]["name"], tc["function"]["arguments"], llamada_session_sandbox)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": json.dumps(result)
+                    })
+                continue # Go back to API call with tool results
+
+            # Is this it?
+            if finalMessage and finalMessage["content"]:
+                addHistory("assistant", finalMessage["content"])
+                if conf.getboolean(llamada_session, 'Verbose', fallback=False) and finalMessage.get("reasoning_content"):
+                    print(f"R: {finalMessage.get('reasoning_content')}", file=sys.stderr)
+            break 
+
+        Q = "" # Have to unset this eventually
+
+    if not args.interactive:
+        break
+
+
