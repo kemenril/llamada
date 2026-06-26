@@ -880,55 +880,67 @@ while True:
                 fullContent = ""
                 fullReasoning = ""
                 fullToolCalls = {} 
-                
-                for chunk in response:
-                    #Apparently sometimes there are empty chunks which function
-                    # as a heartbeat signal, but also we tack usage onto the
-                    # end in a separate chunk.  This may screw up tool calls if
-                    # it's not handled in such a way that we forget about it 
-                    # before handling them below.
-                    if not chunk.choices:
-                        if chunk.usage:
-                            tokenCount += chunk.usage.total_tokens
-                        continue
+                # This block ought to catch problems that happen if the
+                # endpoint dies mid-transmission or doesn't, for some other
+                # reason, furnish all the chunks.  It will also try, but 
+                # probably fail (due to the way this is mostly handled in
+                # Python, to catch keyboard interrupts during streaming.
+                #  Almsot certainly better than nothing.  Could use a ton 
+                # of work.
+                try:
+                    for chunk in response:
+                        #Apparently sometimes there are empty chunks which function
+                        # as a heartbeat signal, but also we tack usage onto the
+                        # end in a separate chunk.  This may screw up tool calls if
+                        # it's not handled in such a way that we forget about it 
+                        # before handling them below.
+                        if not chunk.choices:
+                            if chunk.usage:
+                                tokenCount += chunk.usage.total_tokens
+                            continue
 
-                    choice = chunk.choices[0]
-                    delta = choice.delta
-                    #print(repr(chunk), file=sys.stderr)
+                        choice = chunk.choices[0]
+                        delta = choice.delta
+                        #print(repr(chunk), file=sys.stderr)
 
-                    if delta.content:
-                        print(delta.content, end="", flush=True)
-                        fullContent += delta.content
+                        if delta.content:
+                            print(delta.content, end="", flush=True)
+                            fullContent += delta.content
 
-                    if hasattr(delta,"reasoning_content") and delta.reasoning_content:
-                        fullReasoning += delta.reasoning_content
+                        if hasattr(delta,"reasoning_content") and delta.reasoning_content:
+                            fullReasoning += delta.reasoning_content
 
-                    if delta.tool_calls:
-                        for tc in delta.tool_calls:
-                            idx = tc.index
-                            if idx not in fullToolCalls:
-                                #fullToolCalls[idx] = tc
-                                fullToolCalls[idx] = {
-                                        "id": tc.id,
-                                        "type": "function",
-                                        "function": {
-                                            "name": tc.function.name, 
-                                            "arguments": tc.function.arguments or "", 
-                                        },
-                                        "extra_content": tc.extra_content if hasattr(tc,"extra_content") else None 
-                                        }
-                            else:
-                                fullToolCalls[idx]["function"]["arguments"] += tc.function.arguments or ""
-                    if choice.finish_reason:                    
-                        finishReason = choice.finish_reason
-                        #Gemini, at least adds the (total, per call) usage on 
-                        # all the chunks instead of submitting it separately.  
-                        #We grab it from the last one, here.
-                        if chunk.usage:
-                            tokenCount += chunk.usage.total_tokens
-                #This will mean we've printed something in the stream.
-                if fullContent:
-                    print()
+                        if delta.tool_calls:
+                            for tc in delta.tool_calls:
+                                idx = tc.index
+                                if idx not in fullToolCalls:
+                                    #fullToolCalls[idx] = tc
+                                    fullToolCalls[idx] = {
+                                            "id": tc.id,
+                                            "type": "function",
+                                            "function": {
+                                                "name": tc.function.name, 
+                                                "arguments": tc.function.arguments or "", 
+                                            },
+                                            "extra_content": tc.extra_content if hasattr(tc,"extra_content") else None 
+                                            }
+                                else:
+                                    fullToolCalls[idx]["function"]["arguments"] += tc.function.arguments or ""
+                        if choice.finish_reason:                    
+                            finishReason = choice.finish_reason
+                            #Gemini, at least adds the (total, per call) usage on 
+                            # all the chunks instead of submitting it separately.  
+                            #We grab it from the last one, here.
+                            if chunk.usage:
+                                tokenCount += chunk.usage.total_tokens
+                    #This will mean we've printed something in the stream.
+                    if fullContent:
+                        print()
+
+                except (Exception, KeyboardInterrupt) as e:
+                    print("Error, or interrupt, handling stream: {e}.  You might try again.",file=sys.stderr)
+                    Q = ""
+                    continue
 
                 #We don't print this one, because that has already been done
                 # just above, but we need to assemble it for the tool handler 
