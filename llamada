@@ -938,9 +938,9 @@ while True:
                         print()
 
                 except (Exception, KeyboardInterrupt) as e:
-                    print("Error, or interrupt, handling stream: {e}.  You might try again.",file=sys.stderr)
+                    print(f"Error, or interrupt, handling stream: {e}.  You might try again.",file=sys.stderr)
                     Q = ""
-                    continue
+                    break
 
                 #We don't print this one, because that has already been done
                 # just above, but we need to assemble it for the tool handler 
