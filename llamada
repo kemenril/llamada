@@ -861,14 +861,31 @@ while True:
         #Print an indication that we are sending a query
         print("\u2199", flush=True)
         while True:  # Tool/Response internal loop
+
+            #We use variables to adjust tool parameters, but sometimes
+            # those variables are not defined, so we use None, but the
+            # OpenAI library is stupid about this, or the remote systems
+            # are stupid about it, and things sometimes break from that,
+            # so we also filter out the Nones later.
+            compParams = {
+                "model": conf.get(llamada_session, 'Model', fallback=fallback_model),
+                "temperature": conf.get(llamada_session, 'Model.temperature', fallback=None),
+                "max_tokens": conf.get(llamada_session, 'Model.max_tokens', fallback=None),
+                "top_p": conf.get(llamada_session, 'Model.top_p', fallback=None),
+                "frequency_penalty": conf.get(llamada_session, 'Model.frequency_penalty', fallback=None),
+                "presence_penalty": conf.get(llamada_session, 'Model.presence_penalty', fallback=None),
+                "messages": messages,
+                "tools": [ t for t in TOOLS.values()] if TOOLS.values() else None,
+                "stream": useStreaming,
+                "stream_options": {"include_usage": True} if useStreaming else None,
+            }
+           
+            #There are probably twelve better ways to do this.
+            for empty in [k for k in compParams if not compParams[k]]:
+                del compParams[empty]
+
             try:
-                response = c.chat.completions.create(
-                    model=conf.get(llamada_session, 'Model', fallback=fallback_model),
-                    messages=messages,
-                    tools=[ t for t in TOOLS.values()] if TOOLS.values() else None,
-                    stream=useStreaming,
-                    stream_options={"include_usage": True} if useStreaming else None
-                )
+                response = c.chat.completions.create(**compParams)
             except Exception as e:
                 print(f"\n\x1b[31m⚠ LLM API Error:\x1b[0m {str(e)}", file=sys.stderr)
                 break

@@ -21,12 +21,16 @@ There really isn't a procedure for this at the moment.  Put the script in a dire
 You'll be able to override everything in it by adding a configuration for each session, if you like, but this can contain default endpoint information and so on.  Here's an example, which will be included in the repo separately:
 
       [DEFAULT]
-          URL         = https://llmendpoint.local.net/
-          KEY         = sk-ThisIsntARealLLMAccessToken
-          Streaming   = Yes
-          Model       = gpt-4o-mini
-          ValidateSSL = Yes
-          Verbose     = No
+          URL                 = https://llmendpoint.local.net/
+          KEY                 = sk-ThisIsntARealLLMAccessToken
+          Streaming           = Yes
+          Model               = gpt-4o-mini
+          # If you want, model parameters can also be defined
+          # Model.temperature = 1.1
+          # Model.top_p       = 0.3
+          # Model.max_tokens  = 800
+          ValidateSSL         = Yes
+          Verbose             = No
 
 There are some other options you can include, for loading tools automatically, for example, but this is a good start.
 

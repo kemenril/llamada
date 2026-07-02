@@ -1,8 +1,12 @@
 [DEFAULT]
-    URL         = https://llmendpoint.local.net/
-    KEY         = sk-ThisIsntARealLLMAccessToken
-    Streaming   = Yes
-    Model       = gpt-4o-mini
-    ValidateSSL = Yes
-    Verbose     = No
+    URL                 = https://llmendpoint.local.net/
+    KEY                 = sk-ThisIsntARealLLMAccessToken
+    Streaming           = Yes
+    Model               = gpt-4o-mini
+    # If you want, model parameters can also be defined
+    # Model.temperature = 1.1
+    # Model.top_p       = 0.3
+    # Model.max_tokens  = 800
+    ValidateSSL         = Yes
+    Verbose             = No
 
