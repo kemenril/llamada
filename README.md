@@ -32,6 +32,9 @@ You'll be able to override everything in it by adding a configuration for each s
           ValidateSSL         = Yes
           Verbose             = No
 
+         # You can add a preamble for new sessions, like so:
+         Prompt.preamble      = You are communicating with Rudolpho, who is very happy to know you.  Please give brief, but technically complete responses, for efficiency.  You may have access to local tools, which you can discover using the list_tools and get_tool_schema tools.
+
 There are some other options you can include, for loading tools automatically, for example, but this is a good start.
 
 You may also want to create _~/llamada/tools_, and install some *WASI* binaries there, along with their respective *JSON* schema files.  See the [*llamada_tools*](https://github.com/kemenril/llamada_tools) project.
