@@ -10,3 +10,28 @@
     ValidateSSL         = Yes
     Verbose             = No
 
+    # Various bits instruction, at the moment, just
+    # added back into the preamble later.  Not
+    # used by the software itself, but you can %()s bits
+    # into a new variable assignment when you're running.
+    Prompt.software     = Your user is using an interface called llamada.
+    Prompt.whoami        = Chris
+    Prompt.user = You are communicating with %(Prompt.whoami)s.
+    Prompt.startpreamble = %(Prompt.user)s %(Prompt.software)s
+
+    Prompt.brief = Remember to give all relevant technical information, but try to give brief responses where possible, for efficiency.
+
+    Prompt.tools_int    = You have access to a system of tool calls into the local machine.  You may discover them using the list_tools and get_tool_schema tools.
+    Prompt.tools_ext    = You may also have access to tools for managing, reading, and creating local files, making http requests, and checking the local date/time.
+    Prompt.tools        = %(Prompt.tools_int)s %(Prompt.tools_ext)s
+    Prompt.tools_defer  = There is no need to examine these tools right now; just look over them when it becomes evident that you need to do something for which no built-in means is avaiable.
+
+    Prompt.endpreamble  = This message has been automatically prepended to the chat history for your benefit.  User input follows.
+
+    # This is the only variable that matters here.
+    # ... and it is also not required.
+    #Prompt.preamble    = %(Prompt.startpreamble)s %(Prompt.brief)s %(Prompt.tools)s %(Prompt.tools_defer)s %(Prompt.endpreamble)s
+    Prompt.preamble    = %(Prompt.startpreamble)s %(Prompt.brief)s %(Prompt.endpreamble)s
+
+
+

@@ -293,6 +293,13 @@ def toolRun(name: str, args: str, sandbox: str) -> dict:
     print("(WASI)",file=sys.stderr,flush=True)
     return wasmRun(name,args,sandbox)
 
+# Quick utility function to add to the default value of the next prompt
+def nextPromptAdd(text: str, append: bool = False):
+    global ptFill
+    if not append:
+        ptFill = ""
+    ptFill += text
+
 # Append a row to the session history
 def addHistory(role,content):
     c = llamada_histdb_conn.cursor()
@@ -324,7 +331,6 @@ helpText["lshistory"] = { "ptr" : "gethist" }
 
 #Fetch a history entry, fill in the default prompt text with it.
 def redoHistory(seq):
-    global ptFill
     if not seq.isdecimal():
         print("Please give a proper history sequence number to redo.",file=sys.stderr)
         return
@@ -332,7 +338,7 @@ def redoHistory(seq):
     c.execute("select content FROM conversation WHERE seq = ?;",(seq,))
     r = c.fetchone()
     if r:
-        ptFill = r['content']
+        nextPromptAdd(r['content'],False)
     else:
         print(f"Can't find sequence: {seq}",file=sys.stderr)
 helpText['redohistory'] = {
@@ -782,6 +788,7 @@ varHooks = {
     "url":          conInit,
     "key":          conInit,
     "validatessl":  conInit,
+    "model":        lambda: nextPromptAdd('The model has just been changed.  Be aware that some of the preceeding conversaiton may not have been you.\nMore user input follows.\n\n',True),
     "session":      lambda: sesInit(conf.get(llamada_session,'session')),
 }
 
@@ -830,6 +837,7 @@ while True:
         except KeyboardInterrupt:
             print("Interrupt.", file=sys.stderr)
             Q = ""
+            ptFill = ""
             continue
 
     # Local Commands
@@ -853,6 +861,15 @@ while True:
     # LLM
     if Q:
         messages = getHistory()
+
+        #If it's a new session, or if we've erased the history back to the 
+        # beginning of time, we'll start with an empty history, and in that
+        # case, add the preamble.
+        if not messages:
+            if conf.has_option(llamada_session,'Prompt.preamble'):
+                addHistory("system",conf.get(llamada_session,'Prompt.preamble'))
+                messages = getHistory()
+
         addHistory("user", Q)
         messages.append({"role": "user", "content": Q})
         
@@ -957,6 +974,7 @@ while True:
                 except (Exception, KeyboardInterrupt) as e:
                     print(f"Error, or interrupt, handling stream: {e}.  You might try again.",file=sys.stderr)
                     Q = ""
+                    ptFill = ""
                     break
 
                 #We don't print this one, because that has already been done
