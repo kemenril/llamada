@@ -44,7 +44,7 @@ ptHist = InMemoryHistory()
 # in what should appear in the next line.
 ptFill = ""
 
-import sys,os
+import sys,os, time
 import re
 
 import configparser
@@ -301,10 +301,10 @@ def loadPyTool(tool_name: str) -> bool:
         print(f"Failed to load Python tool {tool_name}: {e}", file=sys.stderr)
         return False
 
-# Run a Python tool (from pyTOOLS)
+# Run a Python tool
 def pyToolRun(name: str, args: str, sandbox: str) -> dict:
     try:
-        result = pyTOOLS[name]["function"](args, sandbox)
+        result = pyTOOLS[name]["function"](args,{'session': llamada_session, 'sandbox_dir': sandbox, 'state_dir': llamada_state_dir, 'session_dir': llamada_session_dir, 'conf': conf})
         return json.loads(result) if isinstance(result, str) else result
     except json.JSONDecodeError as e:
         return {"error": f"Invalid JSON output from tool: {e}"}
@@ -362,12 +362,7 @@ def toolRun(name: str, args: str, sandbox: str) -> dict:
         print("(Python: ",end='',file=sys.stderr,flush=True)
         print("Built-In" if pyTOOLS[name]['builtin'] else "External",file=sys.stderr,flush=True,end="")
         print(")",file=sys.stderr,flush=True)
-        try:
-            return json.loads(pyTOOLS[name]["function"](args,sandbox))
-        except json.JSONDecodeError as e:
-            return {"error": f"Invalid JSON output from tool: (Error: {e})"}
-        except Exception as e:
-            return {"error": f"Python tool error: {str(e)}"}
+        return pyToolRun(name, args, sandbox)
     
     print("(WASI)",file=sys.stderr,flush=True)
     return wasmRun(name, args, sandbox)
@@ -388,12 +383,12 @@ def addHistory(role,content):
 #Get the history
 def getHistory():
     c = llamada_histdb_conn.cursor()
-    c.execute("select role,content from conversation")
+    c.execute("SELECT role,content FROM conversation ORDER BY seq")
     return c.fetchall()
 
 def getHistCLI():
     histCursor = llamada_histdb_conn.cursor()
-    histCursor.execute("select * from conversation")
+    histCursor.execute("SELECT * FROM conversation ORDER BY seq")
     for hItem in histCursor.fetchall():
         hIText = hItem['content'].strip()
         hIText = hIText.replace("\n"," ")
@@ -413,7 +408,7 @@ def redoHistory(seq):
         print("Please give a proper history sequence number to redo.",file=sys.stderr)
         return
     c = llamada_histdb_conn.cursor()
-    c.execute("select content FROM conversation WHERE seq = ?;",(seq,))
+    c.execute("SELECT content FROM conversation WHERE seq = ?;",(seq,))
     r = c.fetchone()
     if r:
         nextPromptAdd(r['content'],False)
@@ -449,7 +444,7 @@ def writeHistory(item):
                         print(f"Got bad history range for write: {hRange}",file=sys.stderr)
                         return
                 else:   #We have a range of two reasonable numbers here.
-                    c.execute("SELECT content FROM conversation WHERE seq BETWEEN ? AND ?",hRange)
+                    c.execute("SELECT content FROM conversation WHERE seq BETWEEN ? AND ? ORDER BY seq",hRange)
             print(f"Write {hseq} to {path}", file=sys.stderr)
             for line in c.fetchall():
                 f.write(line['content'])
@@ -793,7 +788,7 @@ def pyToolRegister(name,func,schema, builtin=False):
 	"builtin": builtin
     }
 
-def toolListTools(args,sandbox):
+def toolListTools(args,context):
     t = []
     for n, s in TOOLS.items():
         t.append({
@@ -818,7 +813,7 @@ pyToolRegister("list_tools",toolListTools,"""
 """, True)
 
 
-def toolGetToolSchema(args,sandbox):
+def toolGetToolSchema(args,context):
     #Args are in stupid JSON
     jArgs = json.loads(args)
     if "tool" in jArgs and jArgs['tool'] in TOOLS:
@@ -1021,6 +1016,10 @@ while True:
             for empty in [k for k in compParams if not compParams[k]]:
                 del compParams[empty]
 
+            #To the user, the stream starts here.  This may change when
+            # the status is displayed, where very slow response is concerned.
+            streamStart = time.time()
+
             try:
                 response = c.chat.completions.create(**compParams)
             except Exception as e:
@@ -1034,20 +1033,99 @@ while True:
                 fullContent = ""
                 fullReasoning = ""
                 fullToolCalls = {} 
+################!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+#                # This block ought to catch problems that happen if the
+#                # endpoint dies mid-transmission or doesn't, for some other
+#                # reason, furnish all the chunks.  It will also try, but 
+#                # probably fail (due to the way this is mostly handled in
+#                # Python, to catch keyboard interrupts during streaming.
+#                #  Almsot certainly better than nothing.  Could use a ton 
+#                # of work.
+#                try:
+#                    for chunk in response:
+#                        #Apparently sometimes there are empty chunks which function
+#                        # as a heartbeat signal, but also we tack usage onto the
+#                        # end in a separate chunk.  This may screw up tool calls if
+#                        # it's not handled in such a way that we forget about it 
+#                        # before handling them below.
+#                        if not chunk.choices:
+#                            if chunk.usage:
+#                                tokenCount += chunk.usage.total_tokens
+#                            continue
+#
+#                        choice = chunk.choices[0]
+#                        delta = choice.delta
+#                        #print(repr(chunk), file=sys.stderr)
+#
+#                        if delta.content:
+#                            print(delta.content, end="", flush=True)
+#                            fullContent += delta.content
+#
+#                        if hasattr(delta,"reasoning_content") and delta.reasoning_content:
+#                            fullReasoning += delta.reasoning_content
+#
+#                        if delta.tool_calls:
+#                            for tc in delta.tool_calls:
+#                                idx = tc.index
+#                                if idx not in fullToolCalls:
+#                                    fullToolCalls[idx] = {
+#                                            "id": tc.id,
+#                                            "type": "function",
+#                                            "function": {
+#                                                "name": tc.function.name, 
+#                                                "arguments": tc.function.arguments or "", 
+#                                            },
+#                                            "extra_content": tc.extra_content if hasattr(tc,"extra_content") else None 
+#                                            }
+#                                else:
+#                                    fullToolCalls[idx]["function"]["arguments"] += tc.function.arguments or ""
+#                        if choice.finish_reason:                    
+#                            finishReason = choice.finish_reason
+#                            #Gemini, at least adds the (total, per call) usage on 
+#                            # all the chunks instead of submitting it separately.  
+#                            #We grab it from the last one, here.
+#                            if chunk.usage:
+#                                tokenCount += chunk.usage.total_tokens
+###############################!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#Revised with status.
+                # A few bits of initialization for the stream status line.
+                chunkCount = 0
+                lastStatusTime = 0.0
+                statusOn = False
                 # This block ought to catch problems that happen if the
                 # endpoint dies mid-transmission or doesn't, for some other
-                # reason, furnish all the chunks.  It will also try, but 
+                # reason, furnish all the chunks.  It will also try, but
                 # probably fail (due to the way this is mostly handled in
                 # Python, to catch keyboard interrupts during streaming.
-                #  Almsot certainly better than nothing.  Could use a ton 
+                #  Almsot certainly better than nothing.  Could use a ton
                 # of work.
                 try:
                     for chunk in response:
-                        #Apparently sometimes there are empty chunks which function
-                        # as a heartbeat signal, but also we tack usage onto the
-                        # end in a separate chunk.  This may screw up tool calls if
-                        # it's not handled in such a way that we forget about it 
-                        # before handling them below.
+                        chunkCount += 1
+                        # Found anything yet?
+                        if not fullContent:
+                            now = time.time()
+                            if now - lastStatusTime > 0.25:
+                                lastStatusTime = now
+                                statusOn = True
+                                elapsed = now - streamStart
+                                rate = chunkCount / elapsed if elapsed > 0 else 0
+                                status = f"  \x1b[36m\u23ce\x1b[0m Waiting on remote... {chunkCount} chunks, {elapsed:.1f}s ({rate:.1f}/s)"
+                                if fullReasoning:
+                                    status += f", {len(fullReasoning)} reasoning chars"
+                                print(f"\r{status}\x1b[K", end="", file=sys.stderr, flush=True)
+                        elif statusOn:
+                            #First actual output.  No more status line.
+                            print("\r\x1b[K", end="", file=sys.stderr, flush=True)
+                            statusOn = False
+
+                        #Apparently sometimes there are empty chunks which 
+                        # function as a heartbeat signal, but also we tack 
+                        # usage onto the end in a separate chunk.  This may 
+                        #screw up tool calls if it's not handled in such a 
+                        # way that we forget about it before handling them 
+                        # below.
                         if not chunk.choices:
                             if chunk.usage:
                                 tokenCount += chunk.usage.total_tokens
@@ -1055,7 +1133,6 @@ while True:
 
                         choice = chunk.choices[0]
                         delta = choice.delta
-                        #print(repr(chunk), file=sys.stderr)
 
                         if delta.content:
                             print(delta.content, end="", flush=True)
@@ -1072,20 +1149,28 @@ while True:
                                             "id": tc.id,
                                             "type": "function",
                                             "function": {
-                                                "name": tc.function.name, 
-                                                "arguments": tc.function.arguments or "", 
+                                                "name": tc.function.name,
+                                                "arguments": tc.function.arguments or "",
                                             },
-                                            "extra_content": tc.extra_content if hasattr(tc,"extra_content") else None 
+                                            "extra_content": tc.extra_content if hasattr(tc,"extra_content") else None
                                             }
                                 else:
                                     fullToolCalls[idx]["function"]["arguments"] += tc.function.arguments or ""
-                        if choice.finish_reason:                    
+                        if choice.finish_reason:
                             finishReason = choice.finish_reason
-                            #Gemini, at least adds the (total, per call) usage on 
-                            # all the chunks instead of submitting it separately.  
+                            #Gemini, at least adds the (total, per call) usage on
+                            # all the chunks instead of submitting it separately.
                             #We grab it from the last one, here.
                             if chunk.usage:
                                 tokenCount += chunk.usage.total_tokens
+                    #Clear any status line still showing (a tool-calls-only
+                    #response never triggers the mid-loop clear, since that
+                    #only fires once fullContent becomes non-empty).
+                    if statusOn:
+                        print("\r\x1b[K", end="", file=sys.stderr, flush=True)
+
+###############################!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
                     #This will mean we've printed something in the stream.
                     if fullContent:
                         print()
