@@ -44,8 +44,8 @@ ptHist = InMemoryHistory()
 # in what should appear in the next line.
 ptFill = ""
 
-import sys,os, time
-import re
+import sys,os,time
+import re, random
 
 import configparser
 import argparse
@@ -764,6 +764,18 @@ helpText["help"] = {
 }
 helpText["?"] = { "ptr": "help" }
 
+#Return either the retry-after, or some random value based on *attempt*
+# so that when we're hitting a rate limit, we do something reasonable.
+def rateLimitDelay(attempt, err):
+    resp = getattr(err, "response", None)
+    if resp is not None:
+        retryAfter = resp.headers.get("Retry-After") if hasattr(resp, "headers") else None
+        if retryAfter:
+            try:
+                return float(retryAfter)
+            except ValueError:
+                pass
+    return min(30, 2 ** attempt) + random.uniform(0, 0.5)
 
 #Clean exit command
 def quit():
@@ -932,6 +944,9 @@ if not args.question:
     args.interactive = True
 
 
+#For rate limiting.
+lastReq = 0
+
 Q="".join(args.question)
 
 # Main execution loop
@@ -1021,7 +1036,29 @@ while True:
             streamStart = time.time()
 
             try:
-                response = c.chat.completions.create(**compParams)
+                rps = conf.getfloat(llamada_session,'RPS',fallback=None)
+                if rps:
+                   #When can lastReq be, and have us run now?
+                   latest = time.time() - (1/rps)
+                   if lastReq > latest:
+                       time.sleep(lastReq-latest)
+
+                maxRetries = conf.getint(llamada_session, 'RateLimit.MaxRetries', fallback=5)
+                attempt = 0
+                while True:
+                    try:
+                        response = c.chat.completions.create(**compParams)
+                        break
+                    except openai.RateLimitError as e:
+                        attempt += 1
+                        if attempt > maxRetries:
+                            raise
+                        delay = rateLimitDelay(attempt, e)
+                        print(f"\r  \x1b[33m\u23f3\x1b[0m Rate limited, retrying in {delay:.1f}s "
+                              f"(attempt {attempt}/{maxRetries})...\x1b[K", end="", file=sys.stderr, flush=True)
+                        time.sleep(delay)
+                        print("\r\x1b[K", end="", file=sys.stderr, flush=True)
+                lastReq = time.time()
             except Exception as e:
                 print(f"\n\x1b[31m\u26a0 LLM API Error:\x1b[0m {str(e)}", file=sys.stderr)
                 break
@@ -1115,7 +1152,6 @@ while True:
                     if statusOn:
                         print("\r\x1b[K", end="", file=sys.stderr, flush=True)
 
-###############################!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
                     #This will mean we've printed something in the stream.
                     if fullContent:
@@ -1171,6 +1207,8 @@ while True:
                 addHistory("assistant", finalMessage["content"])
                 if conf.getboolean(llamada_session, 'Verbose', fallback=False) and finalMessage.get("reasoning_content"):
                     print(f"R: {finalMessage.get('reasoning_content')}", file=sys.stderr)
+            elif not finalMessage or not finalMessage.get("tool_calls"):
+                print(f"\x1b[33m\u26a0\x1b[0m Model returned an empty response (finish_reason={finishReason}).", file=sys.stderr)
             break 
 
         Q = "" # Have to unset this eventually
