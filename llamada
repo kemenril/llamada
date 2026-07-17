@@ -347,20 +347,20 @@ def toolRun(name: str, args: str, sandbox: str) -> dict:
     if name not in TOOLS:   #Be absolutely sure we ought to run it.
         # We've been returning status information to the LLM, but we should
         # also tell the user separately.
-        print(f"  \x1b[36m\u23ce\x1b[0m {name} not loaded/enabled.", file=sys.stderr)
+        print(f"  \x1b[36m\u23ce\x1b[0m {name} not loaded/enabled.", file=sys.stderr,flush=True)
         return {"error": f"Tool {name} not loaded."}
 
     argErr = validateArgs(name, args)
     if argErr is not None:
-        print(f"  \x1b[36m\u23ce\x1b[0m Tool: {name:<18}  (rejected: Validation of arguments against schema failed.)", file=sys.stderr)
+        print(f"  \x1b[36m\u23ce\x1b[0m Tool: {name:<18}  (rejected: Validation of arguments against schema failed.)", file=sys.stderr, flush=True)
         return argErr
 
     print(f"  \x1b[36m\u23ce\x1b[0m Tool: {name:<18}  ", file=sys.stderr, end="")
     
     # Check in order: internal, Python, WASI
     if name in pyTOOLS:
-        print("(Python: ",end='',file=sys.stderr,flush=True)
-        print("Built-In" if pyTOOLS[name]['builtin'] else "External",file=sys.stderr,flush=True,end="")
+        print("(Python: ",end='',file=sys.stderr)
+        print("Built-In" if pyTOOLS[name]['builtin'] else "External",file=sys.stderr,end="")
         print(")",file=sys.stderr,flush=True)
         return pyToolRun(name, args, sandbox)
     
@@ -562,6 +562,7 @@ def loadTool(t):
                 print(f"Loaded {t}",file=sys.stderr)
             else:
                 print(f"Failed to load {t}, but no exception thrown.",file=sys.stderr)
+            sys.stderr.flush()
     except Exception as e:
         print(f"Problem loading {t}: {e}",file=sys.stderr)
         return
@@ -667,7 +668,7 @@ def setVar(v=""):
             print(file=sys.stderr)
     else:
         if not re.search(r"=",v):   #Print a single value.
-            print(f"{v}: {conf.get(llamada_session,v,fallback='<Does not exist.>')}",file=sys.stdout)
+            print(f"{v}: {conf.get(llamada_session,v,fallback='<Does not exist.>')}",file=sys.stderr)
             return
         else:   #Assignment
             segments = v.split('=')
@@ -692,7 +693,7 @@ def lsModels(conn):
     try:
         r = conn.models.list()
         for m in r.data:
-            print(f"{m.id} ({m.owned_by})",file=sys.stdout)
+            print(f"{m.id} ({m.owned_by})",file=sys.stderr)
     except Exception as e:
         print(f"Error getting model list: {e}.  The endpoint may not support this call.",file=sys.stderr)
 
@@ -951,6 +952,10 @@ Q="".join(args.question)
 
 # Main execution loop
 while True:
+    #We're doing odd things with control codes, and maybe we should stabilize
+    #  the output streams a bit.  Flush them each time through.
+    sys.stderr.flush()
+    sys.stdout.flush()
     if not Q and args.interactive:
         try:
             promptString = [('bold underline',conf.get(llamada_session,'Model',fallback=fallback_model))]
@@ -983,7 +988,7 @@ while True:
             elif callForm == 1:
                 cmdTable[nCmd](nPars)
             else:
-                print(f"Not plumbed for commands requiring {callForm} parameters.", file=sys.stderr)
+                print(f"Not plumbed for commands requiring {callForm} parameters.", file=sys.stderr,flush=True)
             
             Q = ""
             continue # Skip LLM logic entirely
@@ -1098,11 +1103,6 @@ while True:
                                 if fullReasoning:
                                     status += f", {len(fullReasoning)} reasoning chars"
                                 print(f"\r{status}\x1b[K", end="", file=sys.stderr, flush=True)
-                        elif statusOn:
-                            #First actual output.  No more status line.
-                            print("\r\x1b[K", end="", file=sys.stderr, flush=True)
-                            statusOn = False
-
                         #Apparently sometimes there are empty chunks which 
                         # function as a heartbeat signal, but also we tack 
                         # usage onto the end in a separate chunk.  This may 
@@ -1118,6 +1118,13 @@ while True:
                         delta = choice.delta
 
                         if delta.content:
+                            if statusOn:
+                                #First actual output.  No more status line.
+                                print("\r\x1b[K", end="", file=sys.stderr, flush=True)
+                                statusOn = False
+                            # Just in case anything was pending.
+                            sys.stderr.flush()
+                            sys.stdout.flush()
                             print(delta.content, end="", flush=True)
                             fullContent += delta.content
 
@@ -1152,11 +1159,6 @@ while True:
                     if statusOn:
                         print("\r\x1b[K", end="", file=sys.stderr, flush=True)
 
-
-                    #This will mean we've printed something in the stream.
-                    if fullContent:
-                        print()
-
                 except (Exception, KeyboardInterrupt) as e:
                     print(f"Error, or interrupt, handling stream: {e}.  You might try again.",file=sys.stderr)
                     Q = ""
@@ -1172,6 +1174,8 @@ while True:
                     "tool_calls": list(fullToolCalls.values()) if fullToolCalls else None,
                     "reasoning_content": fullReasoning or None
                 }
+                if fullContent:  #Maybe we printed something
+                    print('',flush=True)
 
             else: #Streaming is off
                 # Because streaming is a mess, we move this data around too.
@@ -1179,7 +1183,7 @@ while True:
                 finalMessage = response.choices[0].message.model_dump()
                 finishReason = response.choices[0].finish_reason
                 if finalMessage["content"]:
-                    print(finalMessage["content"])
+                    print(finalMessage["content"],flush=True)
 
             # Actual tool execution
             #if finishReason == "tool_calls" and finalMessage.tool_calls:
