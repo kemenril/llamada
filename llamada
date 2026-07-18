@@ -55,6 +55,9 @@ import itertools
 #We use this once:
 from enum import IntEnum
 
+#For debugging options
+debugMess = False
+debugCmds = False
 
 llamada_state_dir="~/llamada"
 #Python stupidity.  If we don't expandjunk, we don't get the right paths in
@@ -104,9 +107,15 @@ ap.add_argument("-i","--interactive",action='store_true',help="Leave the session
 ap.add_argument("--lsmodels",action='store_true',help="List the available models in the remote endpoint and exit.")
 ap.add_argument("--lssessions",action='store_true',help="List the current sessions and exit.")
 ap.add_argument("-w","--wrconfig",action="store_true",help="Write a configuration file matching the given command-line arguments into the session directory.")
+ap.add_argument("--debug",action="store_true",help="Turn on debugging code.")
 ap.add_argument('question',nargs='*')
 
 args = ap.parse_args()
+
+# First, do we turn on debugging?
+if args.debug:
+    debugMess = True
+    debugCmds = True
 
 #The standard Row factory isn't producing output that's close enough to a 
 # real dictionary object to work with the OpenAI API, so a new factory.
@@ -139,6 +148,8 @@ helpText["saveconf"] = { "ptr": "wrconfig" }
 
 #Read and properly handle configuration data
 def getConfig():
+    global debugMess
+    global debugCmds
     conf = configparser.ConfigParser()
     #Assume llamada_state_dir,llamada_session_dir, are already set.
     conf.read([os.path.join(llamada_state_dir,"config"),os.path.join(llamada_session_dir,"config")])
@@ -158,6 +169,9 @@ def getConfig():
         conf[llamada_session]["Streaming"] = str(args.progress)
     if args.verbose:
         conf[llamada_session]["Verbose"] = str(args.verbose)
+    if args.debug:
+        conf[llamada_session]["Debug.Messages"] = debugMess
+        conf[llamada_session]["Debug.Commands"] = debugCmds
 
     #Load all the tools before we might write out the config
     if conf.has_option(llamada_session,"tools"):
@@ -165,6 +179,11 @@ def getConfig():
             loadTool(t)
         conf.remove_option(llamada_session,"tools")
         conf.remove_option("DEFAULT","tools")
+
+    #Finally, for these variables, the in-memory global is authoritative,
+    # but they are stored in the configuration, so reinitialize them here
+    debugMess=conf.get(llamada_session,"Debug.Messages",fallback=debugMess)
+    debugCmds=conf.get(llamada_session,"Debug.Commands",fallback=debugCmds)    
 
     if args.wrconfig:
         wrConfig(conf)
@@ -356,7 +375,8 @@ def toolRun(name: str, args: str, sandbox: str) -> dict:
         return argErr
 
     print(f"  \x1b[36m\u23ce\x1b[0m Tool: {name:<18}  ", file=sys.stderr, end="")
-    
+    if debugMess:
+        print(f"\x1b[35m\u2699\x1b[0m     Debug - Tool Parameters: {args}", file=sys.stderr, flush=True)    
     # Check in order: internal, Python, WASI
     if name in pyTOOLS:
         print("(Python: ",end='',file=sys.stderr)
@@ -366,6 +386,29 @@ def toolRun(name: str, args: str, sandbox: str) -> dict:
     
     print("(WASI)",file=sys.stderr,flush=True)
     return wasmRun(name, args, sandbox)
+
+#Debug helper to test tool calls
+def cmdCallTool(c: str) -> None:
+    try:
+        tool,args = c.strip().split(None, 1)  #That's on whitespace, one break max
+    except Exception as e:
+        print("Please provide parameters in the form of <tool name> <json>", file=sys.stderr)
+        return
+    # If we dump it, we can do some formatting.
+    try:
+        r = toolRun(tool,args, llamada_session_sandbox)
+        print(json.dumps(r,indent=4), file=sys.stderr)
+    except Exception as e:
+        print(f"Error calling tool: {e}",file=sys.stderr)
+
+helpText["calltool"] = {
+    "shortdesc": "Manually invoke a loaded tool.",
+    "desc": ("Calls a tool by name with the supplied JSON argument string, "
+             "using the current session's sandbox."),
+    "syntax": "toolcall <tool_name> <JSON arguments>"
+}
+
+
 
 # Quick utility function to add to the next prompt
 def nextPromptAdd(text: str, append: bool = False):
@@ -671,7 +714,7 @@ def setVar(v=""):
             print(f"{v}: {conf.get(llamada_session,v,fallback='<Does not exist.>')}",file=sys.stderr)
             return
         else:   #Assignment
-            segments = v.split('=')
+            segments = [s.strip() for s in v.split('=')]
             name=segments[0].lower()
             val="=".join(segments[1:])
             if not val:
@@ -748,15 +791,21 @@ def help(subject=""):
 
         #The special case of top-level help
         if not subject:
-            print("The following commands are available, and will be intercepted and handled by the local software.",file=sys.stderr)
+            print("\nThe following commands are available, and will be intercepted and handled by the local software.",file=sys.stderr)
             for cmd in cmdTable.keys():
                 if cmd in helpText and 'ptr' in helpText[cmd]:
                     #Maybe just skip the aliases for brevity.
                     continue
                 desc = helpText[cmd]['shortdesc'] if cmd in helpText and 'shortdesc' in helpText[cmd] else "No description."
                 print(f"{cmd:<16}{desc}",file=sys.stderr)
-            print("You may be able to get documentation for individual commands by writing *help <command>*.",file=sys.stderr)
-
+            if debugCmds:
+                print("\nThe following extra debugging commands are active.",file=sys.stderr)
+                for cmd in debugCmdTable.keys():
+                    if cmd in helpText and 'ptr' in helpText[cmd]:
+                        continue # As above, we should unify these blocks.
+                    desc = helpText[cmd]['shortdesc'] if cmd in helpText and 'shortdesc' in helpText[cmd] else "No description."
+                    print(f"{cmd:<16}{desc}",file=sys.stderr)
+            print("\nYou may be able to get documentation for individual commands by writing *help <command>*.",file=sys.stderr)
     else:
         print(f"No help entry found for {subject}.",file=sys.stderr)
 helpText["help"] = {
@@ -913,13 +962,21 @@ cmdTable = {
 
 }
 
+# Only available when debugCmds
+debugCmdTable = {
+    "calltool":     cmdCallTool,
+    "echo":         lambda x: print(x, file=sys.stderr),
+}
+
 #Functions executed after variables are changed
 varHooks = {
-    "url":          conInit,
-    "key":          conInit,
-    "validatessl":  conInit,
-    "model":        lambda: nextPromptAdd('The model has just been changed.  Be aware that some of the preceeding conversaiton may not have been you.\nMore user input follows.\n\n',True),
-    "session":      lambda: sesInit(conf.get(llamada_session,'session')),
+    "url":            conInit,
+    "key":            conInit,
+    "validatessl":    conInit,
+    "model":          lambda: nextPromptAdd('The model has just been changed.  Be aware that some of the preceeding conversaiton may not have been you.\nMore user input follows.\n\n',True),
+    "session":        lambda: sesInit(conf.get(llamada_session,'session')),
+    "debug.commands": lambda: globals().update(debugCmds=conf.getboolean(llamada_session,'debug.commands')),
+    "debug.messages": lambda: globals().update(debugMess=conf.getboolean(llamada_session,'debug.messages')),
 }
 
 #We put this before session init, instead of down there, because it saves us
@@ -978,15 +1035,21 @@ while True:
     # Local Commands
     if Q:
         components = Q.split()
-        if components and components[0].lower().strip() in cmdTable:
+
+        # A bit more complex now that we have multiple command tables.
+        cmdSpace = cmdTable
+        if debugCmds:
+            cmdSpace |= debugCmdTable
+
+        if components and components[0].lower().strip() in cmdSpace:
             nCmd = components[0].lower().strip()
             nPars = " ".join(components[1:])
             
-            callForm = len(signature(cmdTable[nCmd]).parameters)
+            callForm = len(signature(cmdSpace[nCmd]).parameters)
             if callForm == 0:
-                cmdTable[nCmd]()
+                cmdSpace[nCmd]()
             elif callForm == 1:
-                cmdTable[nCmd](nPars)
+                cmdSpace[nCmd](nPars)
             else:
                 print(f"Not plumbed for commands requiring {callForm} parameters.", file=sys.stderr,flush=True)
             
