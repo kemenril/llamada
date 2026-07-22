@@ -315,15 +315,26 @@ def loadPyTool(tool_name: str) -> bool:
         
         # Store in pyTOOLS registry
         pyToolRegister(tool_name,module.tool_func, module.tool_schema(), False)
+        if hasattr(module,'commands'):
+            pyTOOLS[tool_name]['commands'] = module.commands
+            print(f"  Registered extension commands: {', '.join(module.commands.keys())}", file=sys.stderr)
+        #Run initialization if available
+        if hasattr(module,'tool_init'):
+            print("Init module.")
+            print(json.dumps(module.tool_init(sessionContext()),indent=4),file=sys.stderr)
         return True
     except Exception as e:
         print(f"Failed to load Python tool {tool_name}: {e}", file=sys.stderr)
         return False
 
+#Get a context object for a call into an add-on module
+def sessionContext():
+    return {'session': llamada_session, 'sandbox_dir': llamada_session_sandbox, 'state_dir': llamada_state_dir, 'session_dir': llamada_session_dir, 'conf': conf}
+
 # Run a Python tool
 def pyToolRun(name: str, args: str, sandbox: str) -> dict:
     try:
-        result = pyTOOLS[name]["function"](args,{'session': llamada_session, 'sandbox_dir': sandbox, 'state_dir': llamada_state_dir, 'session_dir': llamada_session_dir, 'conf': conf})
+        result = pyTOOLS[name]["function"](args,sessionContext())
         return json.loads(result) if isinstance(result, str) else result
     except json.JSONDecodeError as e:
         return {"error": f"Invalid JSON output from tool: {e}"}
@@ -1038,18 +1049,41 @@ while True:
 
         # A bit more complex now that we have multiple command tables.
         cmdSpace = cmdTable
+
+        #Extension commands
+        for tool in pyTOOLS.values():
+            if tool.get('commands'):
+                cmdSpace |= tool['commands']
+
+        #Extra debugging commands
         if debugCmds:
             cmdSpace |= debugCmdTable
 
         if components and components[0].lower().strip() in cmdSpace:
             nCmd = components[0].lower().strip()
             nPars = " ".join(components[1:])
-            
-            callForm = len(signature(cmdSpace[nCmd]).parameters)
+           
+            #Need to call Python add-on functions a bit differently, passing
+            # sessionContext() on the end...
+            funcSig = list(signature(cmdSpace[nCmd]).parameters.values())
+            callForm = len(funcSig)
+            #If the last parameter is a dictionary, we assume we should pass
+            # the session context
+            passContext = (callForm > 0) and (funcSig[-1].annotation is dict)
+            #Apparently we finally get switch/case in Python 3.10, but maybe
+            # we don't use it until more people are caught up to current.
             if callForm == 0:
                 cmdSpace[nCmd]()
             elif callForm == 1:
-                cmdSpace[nCmd](nPars)
+                if passContext:
+                    cmdSpace[nCmd](sessionContext())
+                else:
+                    cmdSpace[nCmd](nPars)
+            elif callForm == 2:
+                if passContext:
+                    cmdSpace[nCmd](nPars,sessionContext())
+                else:
+                    print(f"Not plumbed for commands requiring two parameters, where the second is not a session context.", file=sys.stderr,flush=True)
             else:
                 print(f"Not plumbed for commands requiring {callForm} parameters.", file=sys.stderr,flush=True)
             
